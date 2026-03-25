@@ -286,6 +286,28 @@
             Your key is stored locally and never sent anywhere except Google's Gemini API.
           </p>
 
+          <label class="field-label" for="openai-api-key">OpenAI API key</label>
+          <p class="api-key-saved" id="openai-api-key-saved" hidden></p>
+          <input
+            id="openai-api-key"
+            class="field-input"
+            type="password"
+            autocomplete="off"
+            placeholder="sk-…"
+            spellcheck="false"
+          />
+          <button type="button" class="btn-save-key" id="btn-save-openai-key">Save</button>
+          <p class="gemini-key-hint">
+            <a
+              href="https://platform.openai.com/api-keys"
+              target="_blank"
+              rel="noopener noreferrer"
+              >Manage keys at platform.openai.com</a>
+          </p>
+          <p class="privacy-note">
+            Your key is stored locally and only sent to OpenAI when you use OpenAI mode.
+          </p>
+
           <label class="field-label" for="elevenlabs-api-key">ElevenLabs API Key</label>
           <p class="api-key-saved" id="elevenlabs-api-key-saved" hidden></p>
           <input

@@ -194,6 +194,7 @@ class PlaybackProxy extends EventTarget {
 const STORAGE_MODE = "listenMode";
 const STORAGE_LANG = "listenModeLang";
 const STORAGE_GEMINI_KEY = "gemini_api_key";
+const STORAGE_OPENAI_KEY = "openai_api_key";
 const STORAGE_ELEVENLABS_KEY = "elevenlabs_api_key";
 const STORAGE_ELEVENLABS_VOICE = "listenModeElevenLabsVoice";
 /** Last successful script keyed by content hash + mode + language (repeatable playback). */
@@ -201,7 +202,7 @@ const STORAGE_SCRIPT_CACHE = "listenModeScriptCache";
 const STORAGE_SIMPLIFY = "listenModeSimplify";
 const STORAGE_DYSLEXIA = "listenModeDyslexia";
 
-const KEY_MISSING_MSG = "Add your Gemini API key in Settings first.";
+const KEY_MISSING_MSG = "Add your Gemini or OpenAI API key in Settings first.";
 const NOT_ENOUGH_CONTENT_MSG =
   "🙁 This page doesn't have enough text to listen to";
 const AUDIO_UNSUPPORTED_MSG =
@@ -217,6 +218,9 @@ const btnSettingsBack = $("btn-settings-back");
 const apiKeyInput = $("api-key");
 const apiKeySaved = $("api-key-saved");
 const btnSaveKey = $("btn-save-key");
+const openaiApiKeyInput = $("openai-api-key");
+const openaiApiKeySaved = $("openai-api-key-saved");
+const btnSaveOpenAiKey = $("btn-save-openai-key");
 const elevenlabsApiKeyInput = $("elevenlabs-api-key");
 const elevenlabsApiKeySaved = $("elevenlabs-api-key-saved");
 const btnSaveElevenlabsKey = $("btn-save-elevenlabs-key");
@@ -482,7 +486,12 @@ function friendlyError(msg) {
   if (s === "NOT_ENOUGH_CONTENT" || s.includes("NOT_ENOUGH_CONTENT")) {
     return NOT_ENOUGH_CONTENT_MSG;
   }
-  if (s.includes("Add your Gemini API key in Settings first")) {
+  if (
+    s.includes("Add your Gemini API key in Settings first") ||
+    s === "MISSING_AI_KEY" ||
+    s === "MISSING_GEMINI_KEY" ||
+    s === "MISSING_OPENAI_KEY"
+  ) {
     return KEY_MISSING_MSG;
   }
   if (s === ELEVENLABS_401_MSG || /ELEVENLABS_401/i.test(s)) {
@@ -570,11 +579,13 @@ function persistLang() {
 
 async function openSettings() {
   updateSavedKeyHint(await getStoredApiKey());
+  updateOpenAiSavedHint(await getStoredOpenAiKey());
   updateElevenlabsSavedHint(await getStoredElevenlabsKey());
   settingsView.classList.add("is-open");
   settingsView.setAttribute("aria-hidden", "false");
   btnSettings.setAttribute("aria-expanded", "true");
   apiKeyInput.value = "";
+  if (openaiApiKeyInput) openaiApiKeyInput.value = "";
   if (elevenlabsApiKeyInput) elevenlabsApiKeyInput.value = "";
   apiKeyInput.focus();
 }
@@ -602,6 +613,11 @@ async function getStoredApiKey() {
   return String(key || "").trim();
 }
 
+async function getStoredOpenAiKey() {
+  const { [STORAGE_OPENAI_KEY]: key } = await chrome.storage.local.get(STORAGE_OPENAI_KEY);
+  return String(key || "").trim();
+}
+
 async function getStoredElevenlabsKey() {
   const { [STORAGE_ELEVENLABS_KEY]: key } = await chrome.storage.local.get(STORAGE_ELEVENLABS_KEY);
   return String(key || "").trim();
@@ -616,6 +632,18 @@ function updateElevenlabsSavedHint(key) {
   } else {
     elevenlabsApiKeySaved.textContent = "";
     elevenlabsApiKeySaved.hidden = true;
+  }
+}
+
+function updateOpenAiSavedHint(key) {
+  if (!openaiApiKeySaved) return;
+  const k = String(key || "").trim();
+  if (k.length >= 4) {
+    openaiApiKeySaved.textContent = `Saved key ends in ····${k.slice(-4)}`;
+    openaiApiKeySaved.hidden = false;
+  } else {
+    openaiApiKeySaved.textContent = "";
+    openaiApiKeySaved.hidden = true;
   }
 }
 
@@ -865,20 +893,18 @@ function getDyslexiaMode() {
 async function migrateLegacyApiKey() {
   const {
     [STORAGE_GEMINI_KEY]: gemini,
-    openai_api_key: openaiUnderscore,
     openaiApiKey: legacyCamel
   } = await chrome.storage.local.get([
     STORAGE_GEMINI_KEY,
-    "openai_api_key",
     "openaiApiKey"
   ]);
-  if (!gemini && openaiUnderscore) {
-    await chrome.storage.local.set({ [STORAGE_GEMINI_KEY]: openaiUnderscore });
-    await chrome.storage.local.remove("openai_api_key");
-  } else if (!gemini && legacyCamel) {
-    await chrome.storage.local.set({ [STORAGE_GEMINI_KEY]: legacyCamel });
+  // Legacy: older builds used openaiApiKey (camelCase). Migrate into openai_api_key.
+  if (legacyCamel) {
+    await chrome.storage.local.set({ [STORAGE_OPENAI_KEY]: legacyCamel });
     await chrome.storage.local.remove("openaiApiKey");
   }
+  // If gemini exists, keep it; don't auto-copy between providers.
+  void gemini;
 }
 
 async function saveApiKeyFromInput() {
@@ -891,6 +917,21 @@ async function saveApiKeyFromInput() {
   apiKeyInput.value = "";
   updateSavedKeyHint(raw);
   saveFeedback.textContent = "Saved.";
+  setTimeout(() => {
+    saveFeedback.textContent = "";
+  }, 2500);
+}
+
+async function saveOpenAiKeyFromInput() {
+  const raw = openaiApiKeyInput?.value.trim() || "";
+  if (!raw) {
+    saveFeedback.textContent = "Enter an OpenAI key to save, or leave as-is.";
+    return;
+  }
+  await chrome.storage.local.set({ [STORAGE_OPENAI_KEY]: raw });
+  if (openaiApiKeyInput) openaiApiKeyInput.value = "";
+  updateOpenAiSavedHint(raw);
+  saveFeedback.textContent = "OpenAI key saved.";
   setTimeout(() => {
     saveFeedback.textContent = "";
   }, 2500);
@@ -929,6 +970,8 @@ async function loadPrefs() {
   ]);
   const key = await getStoredApiKey();
   updateSavedKeyHint(key);
+  const oaiKey = await getStoredOpenAiKey();
+  updateOpenAiSavedHint(oaiKey);
   const elKey = await getStoredElevenlabsKey();
   updateElevenlabsSavedHint(elKey);
   updateVoiceFieldState(!!elKey);
@@ -954,6 +997,7 @@ async function loadPrefs() {
 btnSettings.addEventListener("click", () => openSettings());
 btnSettingsBack.addEventListener("click", () => closeSettings());
 btnSaveKey.addEventListener("click", () => saveApiKeyFromInput());
+btnSaveOpenAiKey?.addEventListener("click", () => saveOpenAiKeyFromInput());
 btnSaveElevenlabsKey?.addEventListener("click", () => saveElevenlabsKeyFromInput());
 
 modeListen.addEventListener("click", () => setMode("listen"));

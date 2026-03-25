@@ -1,5 +1,6 @@
 const GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_STREAM_MODEL = "gemini-2.0-flash";
+const OPENAI_MODEL = "gpt-4o-mini";
 
 /** Gemini API: reduce empty/blocked outputs; see generateContent in this file. */
 const GEMINI_SAFETY_SETTINGS = [
@@ -158,8 +159,46 @@ function normalizeAudience(raw) {
  * @param {number} [maxTokens]
  */
 async function generateJsonSnippet(system, user, maxTokens = 80) {
-  const apiKey = await getGeminiApiKey();
+  const provider = await getPreferredProvider();
   const promptText = `${system}\n\n${user}`;
+  if (provider === "openai") {
+    const apiKey = await getOpenAiApiKey();
+    const url = "https://api.openai.com/v1/chat/completions";
+
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model: OPENAI_MODEL,
+          messages: [
+            { role: "system", content: String(system || "") },
+            { role: "user", content: String(user || "") }
+          ],
+          temperature: 0.3,
+          max_tokens: Math.min(512, Math.max(32, maxTokens))
+        })
+      });
+    } catch (err) {
+      console.log("[ListenMode] OpenAI JSON snippet fetch failed:", err?.message || err, err);
+      throw new Error("NETWORK_ERROR");
+    }
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      console.log("[ListenMode] OpenAI JSON snippet HTTP error:", res.status, errText);
+      throw new Error(friendlyOpenAiHttpError(res.status, errText));
+    }
+
+    const data = await res.json();
+    return extractTextFromOpenAiChatResponse(data);
+  }
+
+  const apiKey = await getGeminiApiKey();
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
   let res;
@@ -272,20 +311,35 @@ export function styleInstructionFromDifficulty(complexity, audience) {
  * @returns {Promise<string>}
  */
 async function getGeminiApiKey() {
-  const { gemini_api_key, openai_api_key } = await chrome.storage.local.get([
-    "gemini_api_key",
-    "openai_api_key"
-  ]);
-  let apiKey = (gemini_api_key || "").trim();
-  if (!apiKey && (openai_api_key || "").trim()) {
-    apiKey = String(openai_api_key).trim();
-    await chrome.storage.local.set({ gemini_api_key: apiKey });
-    await chrome.storage.local.remove("openai_api_key");
-  }
-  if (!apiKey) {
-    throw new Error("Add your Gemini API key in Settings first.");
-  }
+  const { gemini_api_key } = await chrome.storage.local.get(["gemini_api_key"]);
+  const apiKey = String(gemini_api_key || "").trim();
+  if (!apiKey) throw new Error("MISSING_GEMINI_KEY");
   return apiKey;
+}
+
+/**
+ * @returns {Promise<string>}
+ */
+async function getOpenAiApiKey() {
+  const { openai_api_key } = await chrome.storage.local.get(["openai_api_key"]);
+  const apiKey = String(openai_api_key || "").trim();
+  if (!apiKey) throw new Error("MISSING_OPENAI_KEY");
+  return apiKey;
+}
+
+/**
+ * Decide which model/provider to use.
+ * Prefer OpenAI if a key is present, otherwise fall back to Gemini.
+ * @returns {Promise<"openai" | "gemini">}
+ */
+async function getPreferredProvider() {
+  const { openai_api_key, gemini_api_key } = await chrome.storage.local.get([
+    "openai_api_key",
+    "gemini_api_key"
+  ]);
+  if (String(openai_api_key || "").trim()) return "openai";
+  if (String(gemini_api_key || "").trim()) return "gemini";
+  throw new Error("MISSING_AI_KEY");
 }
 
 /**
@@ -324,11 +378,103 @@ function friendlyGeminiHttpError(status, body) {
 }
 
 /**
+ * @param {number} status
+ * @param {string} body
+ */
+function friendlyOpenAiHttpError(status, body) {
+  let msg = "";
+  try {
+    const j = JSON.parse(body);
+    msg = j?.error?.message || j?.message || "";
+  } catch {
+    /* ignore */
+  }
+  if (status === 401 || status === 403) {
+    return "Invalid OpenAI API key or access denied. Check your key in Settings.";
+  }
+  if (status === 429) {
+    return "Too many requests — wait a moment and retry";
+  }
+  if (status === 402 || status === 400) {
+    if (/quota|billing|payment|insufficient|credits/i.test(body || msg)) {
+      return "OpenAI account or quota issue. Check your OpenAI billing/quota.";
+    }
+    return msg || "The request couldn’t be completed. Try again.";
+  }
+  if (status >= 500) {
+    return "OpenAI is temporarily unavailable. Try again shortly.";
+  }
+  return msg ? `${msg} (HTTP ${status})` : `Network error (${status}). Try again.`;
+}
+
+/**
+ * @param {unknown} data Parsed JSON from OpenAI chat.completions
+ * @returns {string}
+ */
+function extractTextFromOpenAiChatResponse(data) {
+  const txt = data?.choices?.[0]?.message?.content;
+  const out = typeof txt === "string" ? txt.trim() : "";
+  if (!out) {
+    throw new Error("OpenAI returned an empty response. Please try a different page.");
+  }
+  return out;
+}
+
+/**
+ * @param {string} system
+ * @param {string} user
+ * @param {number} [maxTokens]
+ */
+async function generateContentOpenAi(system, user, maxTokens = 1200) {
+  const apiKey = await getOpenAiApiKey();
+  const url = "https://api.openai.com/v1/chat/completions";
+  const messages = [
+    { role: "system", content: String(system || "") },
+    { role: "user", content: String(user || "") }
+  ];
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages,
+        temperature: 0.7,
+        max_tokens: Math.min(2048, maxTokens)
+      })
+    });
+  } catch (err) {
+    console.log("[ListenMode] OpenAI fetch failed (network/CSP):", err?.message || err, err);
+    throw new Error("NETWORK_ERROR");
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    console.log("[ListenMode] OpenAI HTTP error:", res.status, errText);
+    throw new Error(friendlyOpenAiHttpError(res.status, errText));
+  }
+
+  const data = await res.json();
+  return extractTextFromOpenAiChatResponse(data);
+}
+
+/**
  * @param {string} system
  * @param {string} user
  * @param {number} [maxTokens] Capped at 2048 in generationConfig.
  */
 async function generateContent(system, user, maxTokens = 1200) {
+  const provider = await getPreferredProvider();
+  if (provider === "openai") {
+    // Keep the same "never empty" behavior by augmenting user content like Gemini does.
+    return generateContentOpenAi(system, augmentUserContent(user), maxTokens);
+  }
+
   const apiKey = await getGeminiApiKey();
   const promptText = `${system}\n\n${augmentUserContent(user)}`;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
@@ -384,6 +530,11 @@ async function generateContent(system, user, maxTokens = 1200) {
  * @param {number} [maxTokens]
  */
 async function generateContentDirect(system, user, maxTokens = 512) {
+  const provider = await getPreferredProvider();
+  if (provider === "openai") {
+    return generateContentOpenAi(system, user, maxTokens);
+  }
+
   const apiKey = await getGeminiApiKey();
   const promptText = `${system}\n\n${user}`;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
@@ -734,6 +885,16 @@ ${String(content || "")}`;
  * @param {string} [apiKey]
  */
 export async function* streamListenScript(content, language, apiKey) {
+  const provider = await getPreferredProvider();
+  if (provider === "openai") {
+    const system = "You are a voice narrator reading web content aloud.";
+    const user = buildStreamListenPrompt(content, language);
+    const raw = await generateContentOpenAi(system, user, 450);
+    const sentences = splitIntoSentenceChunks(raw);
+    for (const s of sentences) yield s;
+    return;
+  }
+
   const key = String(apiKey || "").trim() || (await getGeminiApiKey());
   const promptText = buildStreamListenPrompt(content, language);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_STREAM_MODEL}:streamGenerateContent?key=${encodeURIComponent(
