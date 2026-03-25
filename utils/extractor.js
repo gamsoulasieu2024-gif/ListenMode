@@ -3,8 +3,6 @@
  * lives in content/content.js so the content script does not need dynamic import().
  */
 
-import * as pdfjsLib from "../libs/pdf.min.mjs";
-
 export const PDF_EXTRACT_CAP = 8000;
 
 export const PDF_EXTRACT_FAIL_MSG =
@@ -46,51 +44,6 @@ export async function probePdfContentType(url) {
     return ct.includes("application/pdf");
   } catch {
     return false;
-  }
-}
-
-/**
- * Extract plain text from a PDF URL via bundled PDF.js (MV3-safe).
- * @param {string} pdfUrl
- * @returns {Promise<{ title: string, content: string | null, error?: string }>}
- */
-export async function extractPDFContent(pdfUrl) {
-  try {
-    pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("libs/pdf.worker.min.mjs");
-
-    const result = await chrome.runtime.sendMessage({
-      action: "fetchURL",
-      url: pdfUrl
-    });
-    if (!result?.success) throw new Error(result?.error || "Fetch failed");
-    const arrayBuffer = new Uint8Array(result.data || []).buffer;
-
-    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-
-    let fullText = "";
-    const maxPages = Math.min(pdf.numPages, 20);
-
-    for (let i = 1; i <= maxPages; i++) {
-      const page = await pdf.getPage(i);
-      const content = await page.getTextContent();
-      const pageText = content.items.map((item) => item.str).join(" ");
-      fullText += pageText + "\n\n";
-    }
-
-    const title = decodeURIComponent(
-      (pdfUrl.split("/").pop() || "PDF Document").replace(".pdf", "")
-    );
-
-    return {
-      title,
-      content: fullText.trim().slice(0, PDF_EXTRACT_CAP)
-    };
-  } catch (err) {
-    return {
-      title: "PDF Document",
-      content: null,
-      error: "Could not read PDF: " + String(err?.message || err)
-    };
   }
 }
 

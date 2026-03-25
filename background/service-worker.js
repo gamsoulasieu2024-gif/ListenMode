@@ -1,6 +1,5 @@
 import {
   payloadToContextText,
-  extractPDFContent,
   urlLooksLikePdf,
   probePdfContentType
 } from "../utils/extractor.js";
@@ -99,8 +98,8 @@ async function ensureOffscreen() {
   });
   await chrome.offscreen.createDocument({
     url: chrome.runtime.getURL("offscreen/offscreen.html"),
-    reasons: ["AUDIO_PLAYBACK"],
-    justification: "ListenMode playback continues when the popup is closed"
+    reasons: ["AUDIO_PLAYBACK", "DOM_PARSER"],
+    justification: "Offscreen audio playback and PDF text extraction"
   });
   await Promise.race([ready, new Promise((r) => setTimeout(r, 4000))]);
 }
@@ -129,6 +128,29 @@ function sendToOffscreen(msg) {
       }
     });
   });
+}
+
+/**
+ * Parse PDF bytes in the offscreen document to avoid PDF.js eval() usage in the service worker.
+ * @param {string} pdfUrl
+ * @returns {Promise<{ ok: boolean, success?: boolean, text?: string, pageCount?: number, error?: string }>}
+ */
+async function parsePDFInOffscreen(pdfUrl) {
+  const result = await chrome.runtime.sendMessage({
+    action: "fetchURL",
+    url: pdfUrl
+  });
+  if (!result?.success) {
+    return { ok: false, success: false, error: String(result?.error || "Fetch failed") };
+  }
+
+  await ensureOffscreen();
+  return /** @type {any} */ (
+    await sendToOffscreen({
+      type: "LISTENMODE_PARSE_PDF",
+      data: Array.isArray(result.data) ? result.data : []
+    })
+  );
 }
 
 /**
@@ -552,11 +574,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         let payload;
         if (isPdf) {
           try {
-            const { title, content } = await extractPDFContent(tab?.url || "");
-            const t = String(title || "").trim();
-            const c = String(content || "").trim();
-            const text = t ? `Title: ${t}\n\n${c}` : c;
-            payload = { text };
+            const url = String(tab?.url || "");
+            const out = await parsePDFInOffscreen(url);
+            if (!out?.success) throw new Error(String(out?.error || "Could not extract PDF text."));
+            payload = { text: String(out.text || "").trim() };
           } catch (e) {
             sendResponse({
               ok: false,

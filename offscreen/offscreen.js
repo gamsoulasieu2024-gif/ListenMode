@@ -1,4 +1,5 @@
 import AudioPlayer, { AudioPipeline } from "../utils/audio.js";
+import * as pdfjsLib from "../libs/pdf.min.mjs";
 
 const player = new AudioPlayer();
 let pipeline = null;
@@ -141,6 +142,38 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const s = player.getPlaybackState();
       sendResponse({ ok: true, ...s });
     }
+    return true;
+  }
+
+  if (msg?.type === "LISTENMODE_PARSE_PDF") {
+    (async () => {
+      try {
+        const data = new Uint8Array(Array.isArray(msg.data) ? msg.data : []);
+        if (!data.byteLength) throw new Error("Missing PDF data");
+
+        const loadingTask = pdfjsLib.getDocument({
+          data,
+          disableWorker: true,
+          isEvalSupported: false,
+          useSystemFonts: true
+        });
+
+        const pdf = await loadingTask.promise;
+        let fullText = "";
+        const maxPages = Math.min(Number(pdf.numPages) || 0, 20);
+
+        for (let i = 1; i <= maxPages; i++) {
+          const page = await pdf.getPage(i);
+          const content = await page.getTextContent();
+          fullText += content.items.map((item) => item.str).join(" ") + "\n\n";
+        }
+
+        const text = fullText.trim().slice(0, 4000);
+        sendResponse({ success: true, text, pageCount: pdf.numPages });
+      } catch (err) {
+        sendResponse({ success: false, error: String(err?.message || err) });
+      }
+    })();
     return true;
   }
 
