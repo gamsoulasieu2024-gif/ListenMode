@@ -106,7 +106,21 @@ No punctuation, no quotes, no explanation—only that single word.`;
 
   const user = `Page content:\n\n${snippet}`;
   const raw = await generateContent(system, user, 32);
-  return normalizeContentType(raw);
+  // Defensive: Gemini sometimes returns fenced code or JSON despite instructions.
+  const parsed = safeParseJSON(raw);
+  const candidate =
+    parsed && typeof parsed === "object"
+      ? parsed?.contentType || parsed?.category || parsed?.type
+      : null;
+  if (typeof candidate === "string" && candidate.trim()) {
+    return normalizeContentType(candidate);
+  }
+
+  const cleaned = String(raw || "")
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+  return normalizeContentType(cleaned);
 }
 
 /** @typedef {"basic" | "intermediate" | "advanced"} Complexity */
@@ -161,7 +175,9 @@ async function generateJsonSnippet(system, user, maxTokens = 80) {
           temperature: 0.3,
           topP: 0.9,
           maxOutputTokens: Math.min(2048, maxTokens),
-          responseMimeType: "application/json"
+          // Prefer official camelCase, keep snake_case for compatibility with clients/docs that still reference it.
+          responseMimeType: "application/json",
+          response_mime_type: "application/json"
         }
       })
     });
@@ -197,15 +213,20 @@ export async function detectDifficulty(content) {
   const snippet = String(content || "").slice(0, 12000);
   const system = `You assess how difficult the SOURCE TEXT is for a listener and who it is written for.
 
-Return JSON only with exactly these keys (string values, lowercase):
-- "complexity": one of "basic", "intermediate", "advanced"
-- "audience": one of "general", "technical", "academic"
+Respond ONLY with a raw JSON object, no markdown, no explanation, no code fences. Exactly this format:
+{"complexity":"basic","audience":"general"}
 
-No other keys. No markdown.`;
+Allowed values:
+complexity: basic | intermediate | advanced
+audience: general | technical | academic`;
 
   const user = `Source text:\n\n${snippet}`;
   const rawJson = await generateJsonSnippet(system, user, 50);
-  const parsed = parseJsonFromModel(rawJson);
+  const parsed = safeParseJSON(rawJson);
+  // Enhancement-only: never throw here; default silently if parsing fails.
+  if (!parsed || typeof parsed !== "object") {
+    return { complexity: "intermediate", audience: "general" };
+  }
   return {
     complexity: normalizeComplexity(parsed?.complexity),
     audience: normalizeAudience(parsed?.audience)
@@ -452,11 +473,47 @@ function splitIntoSentenceChunks(text) {
  * @returns {Record<string, unknown>}
  */
 function parseJsonFromModel(raw) {
-  let t = String(raw).trim();
-  if (t.startsWith("```")) {
-    t = t.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+  const original = String(raw).trim();
+  let t = original;
+
+  // Safety: some models wrap JSON in markdown fences.
+  // Strip only when it explicitly declares json to avoid mangling code blocks that aren't JSON.
+  if (/^```json\b/i.test(t)) {
+    t = t.replace(/^```json\s*/i, "").replace(/\s*```\s*$/i, "").trim();
   }
-  return JSON.parse(t);
+
+  try {
+    return JSON.parse(t);
+  } catch (e) {
+    // Fallback: keep raw model text so callers can still display something.
+    return { summary: original };
+  }
+}
+
+function safeParseJSON(text) {
+  // Strip markdown code fences if present
+  const cleaned = String(text || "")
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+
+  // Try direct parse first
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // Extract using regex as fallback
+    const complexity = cleaned.match(
+      /"complexity"\s*:\s*"(basic|intermediate|advanced)"/i
+    )?.[1];
+    const audience = cleaned.match(
+      /"audience"\s*:\s*"(general|technical|academic)"/i
+    )?.[1];
+
+    if (complexity && audience) {
+      return { complexity, audience };
+    }
+    return null;
+  }
 }
 
 /**
@@ -501,7 +558,9 @@ async function generateContentJSON(system, user, maxTokens = 1200) {
           temperature: 0.7,
           topP: 0.95,
           maxOutputTokens: Math.min(2048, maxTokens),
-          responseMimeType: "application/json"
+          // Prefer official camelCase, keep snake_case for compatibility with clients/docs that still reference it.
+          responseMimeType: "application/json",
+          response_mime_type: "application/json"
         }
       })
     });
@@ -591,6 +650,14 @@ Output valid JSON only. No markdown fences.`;
   try {
     const rawJson = await generateContentJSON(system, user, 1100);
     const parsed = parseJsonFromModel(rawJson);
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.script !== "string" ||
+      !parsed.script.trim()
+    ) {
+      throw new Error("Gemini returned invalid JSON for script.");
+    }
     const scriptRaw = parsed?.script;
     const sentencesRaw = parsed?.sentences;
     const { script, sentences, wordTimings } = finalizeScriptPayload(
@@ -689,6 +756,14 @@ Output valid JSON only. No markdown fences.`;
   try {
     const rawJson = await generateContentJSON(system, user, 2200);
     const parsed = parseJsonFromModel(rawJson);
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.script !== "string" ||
+      !parsed.script.trim()
+    ) {
+      throw new Error("Gemini returned invalid JSON for script.");
+    }
     const { script, sentences, wordTimings } = finalizeScriptPayload(
       String(parsed?.script ?? ""),
       parsed?.sentences
