@@ -1,4 +1,5 @@
 const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_STREAM_MODEL = "gemini-2.0-flash";
 
 /** Gemini API: reduce empty/blocked outputs; see generateContent in this file. */
 const GEMINI_SAFETY_SETTINGS = [
@@ -703,6 +704,151 @@ ${depthStyle}`;
       audience,
       simplified: forceSimplify
     };
+  }
+}
+
+/**
+ * Build a fast, short spoken script prompt for streaming TTS.
+ * "Be concise..." is intentionally included to reduce first-token latency.
+ * @param {string} content
+ * @param {string} language
+ */
+function buildStreamListenPrompt(content, language) {
+  const langName = langCodeToOutputName(language);
+  return `You are a voice narrator reading web content aloud.
+
+Be concise. Maximum 150 words. No introduction, start speaking immediately.
+No headings. No bullet characters. No URLs. Short sentences.
+Write entirely in ${langName}.
+
+Source text:
+${String(content || "")}`;
+}
+
+/**
+ * Stream a listen script as sentences (yields as they arrive).
+ * NOTE: This uses Gemini's streaming endpoint and returns plain text (not JSON).
+ *
+ * @param {string} content
+ * @param {string} language
+ * @param {string} [apiKey]
+ */
+export async function* streamListenScript(content, language, apiKey) {
+  const key = String(apiKey || "").trim() || (await getGeminiApiKey());
+  const promptText = buildStreamListenPrompt(content, language);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_STREAM_MODEL}:streamGenerateContent?key=${encodeURIComponent(
+    key
+  )}`;
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: promptText }] }],
+        safetySettings: GEMINI_SAFETY_SETTINGS,
+        generationConfig: {
+          temperature: 0.7,
+          topP: 0.95,
+          maxOutputTokens: 450
+        }
+      })
+    });
+  } catch (err) {
+    console.log("[ListenMode] Gemini stream fetch failed:", err?.message || err, err);
+    throw new Error("NETWORK_ERROR");
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(friendlyGeminiHttpError(res.status, errText));
+  }
+
+  if (!res.body) {
+    // Fallback: no streaming body (shouldn't happen in modern Chrome)
+    const data = await res.json().catch(() => null);
+    const txt = data ? extractTextFromGeminiResponse(data) : "";
+    if (txt.trim()) yield txt.trim();
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let textAcc = "";
+  let sentenceCarry = "";
+
+  const sentenceRegex = /[^.!?]+[.!?]+/g;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    // Gemini streaming responses often arrive as newline-delimited JSON or SSE-ish "data:" lines.
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+
+    for (const lineRaw of lines) {
+      const line = lineRaw.trim();
+      if (!line) continue;
+      const jsonText = line.startsWith("data:") ? line.slice(5).trim() : line;
+      if (jsonText === "[DONE]") continue;
+
+      let obj;
+      try {
+        obj = JSON.parse(jsonText);
+      } catch {
+        // If chunk boundaries split JSON, carry it forward.
+        buffer = jsonText + "\n" + buffer;
+        continue;
+      }
+
+      const parts = obj?.candidates?.[0]?.content?.parts;
+      const delta = Array.isArray(parts)
+        ? parts.map((p) => (p && typeof p.text === "string" ? p.text : "")).join("")
+        : "";
+      if (!delta) continue;
+
+      textAcc += delta;
+
+      // Emit complete sentences as soon as we have them.
+      let scan = (sentenceCarry + delta).replace(/\s+/g, " ");
+      let match;
+      let lastIndex = 0;
+      while ((match = sentenceRegex.exec(scan)) !== null) {
+        const sent = match[0].trim();
+        if (sent) yield sent;
+        lastIndex = match.index + match[0].length;
+      }
+      sentenceCarry = scan.slice(lastIndex).trimStart();
+    }
+  }
+
+  // Flush any remaining buffered line.
+  const tail = buffer.trim();
+  if (tail) {
+    try {
+      const obj = JSON.parse(tail.startsWith("data:") ? tail.slice(5).trim() : tail);
+      const parts = obj?.candidates?.[0]?.content?.parts;
+      const delta = Array.isArray(parts)
+        ? parts.map((p) => (p && typeof p.text === "string" ? p.text : "")).join("")
+        : "";
+      if (delta) {
+        textAcc += delta;
+        sentenceCarry = (sentenceCarry + " " + delta).replace(/\s+/g, " ").trim();
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (sentenceCarry.trim()) {
+    yield sentenceCarry.trim();
+  } else if (textAcc.trim()) {
+    yield textAcc.trim();
   }
 }
 

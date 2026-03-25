@@ -5,6 +5,7 @@ import {
   probePdfContentType
 } from "../utils/extractor.js";
 import { generateListenScript, generateUnderstandScript } from "../utils/ai.js";
+import { streamListenScript } from "../utils/ai.js";
 
 /**
  * Gemini HTTP calls are implemented in ../utils/ai.js (safetySettings, generationConfig,
@@ -27,6 +28,8 @@ let lastPercentage = 0;
 let lastPaused = false;
 /** True after a successful LISTENMODE_PLAY until end / error / stop. */
 let sessionActive = false;
+/** @type {AbortController | null} */
+let streamAbort = null;
 
 // --- MV3 keep-alive (session-scoped) ---
 /** @type {ReturnType<typeof setInterval> | null} */
@@ -236,6 +239,37 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // External fetch proxy to avoid extension page CSP restrictions.
+  // Content scripts / extension pages can request bytes via this handler.
+  if (message?.action === "fetchURL") {
+    (async () => {
+      try {
+        const url = String(message.url || "");
+        if (!url) throw new Error("Missing url");
+        const method = String(message.method || "GET").toUpperCase();
+
+        const r = await fetch(url, { method, credentials: "include" });
+        const contentType = r.headers.get("content-type") || "";
+
+        if (method === "HEAD") {
+          sendResponse({ success: true, status: r.status, contentType });
+          return;
+        }
+
+        const buffer = await r.arrayBuffer();
+        sendResponse({
+          success: true,
+          status: r.status,
+          contentType,
+          data: Array.from(new Uint8Array(buffer))
+        });
+      } catch (err) {
+        sendResponse({ success: false, error: String(err?.message || err) });
+      }
+    })();
+    return true; // keep channel open for async response
+  }
+
   // Popup session keep-alive control (prevents MV3 cold starts mid-session).
   if (message?.action === "sessionStart") {
     startKeepAlive();
@@ -265,6 +299,80 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   (async () => {
     try {
+      if (message?.type === "LISTENMODE_STREAM_LISTEN") {
+        // Abort any previous stream session.
+        try {
+          streamAbort?.abort();
+        } catch {
+          /* ignore */
+        }
+        streamAbort = new AbortController();
+
+        const ctx = String(message.context || "");
+        const lang = String(message.lang || "en");
+        const elevenKey = String(message.elevenApiKey || "").trim();
+        const voiceId = String(message.voiceId || "").trim();
+        const tabId = message.tabId != null ? Number(message.tabId) : null;
+        const pageTitle = String(message.pageTitle || "");
+
+        if (!ctx.trim()) {
+          sendResponse({ ok: false, error: "Nothing to read.", retry: true });
+          return;
+        }
+        if (!elevenKey || !voiceId) {
+          sendResponse({ ok: false, error: "Missing ElevenLabs credentials.", retry: true });
+          return;
+        }
+
+        await ensureOffscreen();
+        playbackTabId = Number.isFinite(tabId) ? tabId : null;
+        pageTitleForMini = pageTitle;
+        lastPercentage = 0;
+        lastPaused = false;
+        sessionActive = true;
+
+        // Initialize the offscreen streaming pipeline.
+        await sendToOffscreen({
+          type: "LISTENMODE_OFFSCREEN_STREAM_INIT",
+          options: { tabId: playbackTabId }
+        });
+
+        sendResponse({ ok: true });
+
+        // Start streaming Gemini sentences and enqueue ElevenLabs fetches immediately.
+        let added = 0;
+        try {
+          for await (const sentence of streamListenScript(ctx, lang)) {
+            if (streamAbort?.signal.aborted) break;
+            const s = String(sentence || "").trim();
+            if (s.length < 10) continue;
+            added += 1;
+            void chrome.runtime
+              .sendMessage({
+                type: "LISTENMODE_OFFSCREEN_STREAM_ADD",
+                text: s,
+                voiceId,
+                apiKey: elevenKey
+              })
+              .catch(() => {});
+          }
+        } catch (e) {
+          console.log("[ListenMode] streamListenScript failed:", e?.message || e, e);
+          // Stop pipeline on failure so UI gets end event.
+          try {
+            await sendToOffscreen({ type: "LISTENMODE_OFFSCREEN_CMD", cmd: "stop" });
+          } catch {
+            /* ignore */
+          }
+          sessionActive = false;
+          playbackTabId = null;
+          playbackUrl = "";
+          pageTitleForMini = "";
+          void closeOffscreenDocument();
+        }
+        return;
+      }
+
       if (message?.type === "LISTENMODE_PLAY") {
         const opt = message.options || {};
         const tid = opt.tabId != null ? Number(opt.tabId) : null;
@@ -319,6 +427,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       if (message?.type === "LISTENMODE_AUDIO_CMD") {
         const cmd = message.cmd;
+        if (cmd === "stop") {
+          try {
+            streamAbort?.abort();
+          } catch {
+            /* ignore */
+          }
+          streamAbort = null;
+        }
         await ensureOffscreen();
         /** @type {{ type: string, cmd: string, seconds?: number, rate?: number }} */
         const payload = { type: "LISTENMODE_OFFSCREEN_CMD", cmd };
@@ -436,7 +552,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         let payload;
         if (isPdf) {
           try {
-            const { title, content } = await extractPDFContent(tabId);
+            const { title, content } = await extractPDFContent(tab?.url || "");
             const t = String(title || "").trim();
             const c = String(content || "").trim();
             const text = t ? `Title: ${t}\n\n${c}` : c;

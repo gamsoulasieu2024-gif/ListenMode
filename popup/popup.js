@@ -1341,6 +1341,33 @@ async function runStartFlow(opts = {}) {
       sourceMode
     };
 
+    // Streamed, chunked pipeline for Listen mode + ElevenLabs.
+    if (mode === "listen") {
+      const elevenKey = await getStoredElevenlabsKey();
+      const voiceId = getSelectedVoiceId();
+      if (String(elevenKey || "").trim() && String(voiceId || "").trim()) {
+        setStatus("Generating audio…", { busy: true });
+        const pageTitle = await getTabTitle(ext.tabId);
+        const r = await chrome.runtime.sendMessage({
+          type: "LISTENMODE_STREAM_LISTEN",
+          context: ext.context,
+          lang,
+          tabId: ext.tabId,
+          elevenApiKey: elevenKey,
+          voiceId,
+          pageTitle
+        });
+        if (!r?.ok) {
+          setStatus("");
+          showError(r?.error || "Streaming failed.");
+          return;
+        }
+        // Playback events will drive the UI via PlaybackProxy.
+        setStatus("Generating audio…", { busy: false });
+        return;
+      }
+    }
+
     await generateAndPlay(ext.context, lang, mode, {
       skipCache,
       tabId: ext.tabId != null ? ext.tabId : undefined,

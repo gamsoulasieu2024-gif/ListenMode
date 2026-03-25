@@ -1,6 +1,7 @@
-import AudioPlayer from "../utils/audio.js";
+import AudioPlayer, { AudioPipeline } from "../utils/audio.js";
 
 const player = new AudioPlayer();
+let pipeline = null;
 
 /** @type {number | null} */
 let activeTabId = null;
@@ -52,6 +53,42 @@ player.addEventListener("progress", (e) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === "LISTENMODE_OFFSCREEN_STREAM_INIT") {
+    activeTabId =
+      msg.options?.tabId != null && Number.isFinite(Number(msg.options.tabId))
+        ? Number(msg.options.tabId)
+        : null;
+    try {
+      pipeline?.stop();
+    } catch {
+      /* ignore */
+    }
+    pipeline = new AudioPipeline();
+    pipeline.addEventListener("start", () => relay("start", {}));
+    pipeline.addEventListener("pause", () => relay("pause", {}));
+    pipeline.addEventListener("resume", () => relay("resume", {}));
+    pipeline.addEventListener("end", () => {
+      relay("end", {});
+      activeTabId = null;
+      pipeline = null;
+    });
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg?.type === "LISTENMODE_OFFSCREEN_STREAM_ADD") {
+    if (!pipeline) {
+      sendResponse({ ok: false, error: "No active pipeline." });
+      return true;
+    }
+    const { text, voiceId, apiKey } = msg;
+    pipeline
+      .addSentence(String(text || ""), String(voiceId || ""), String(apiKey || ""))
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e), status: e?.status }));
+    return true;
+  }
+
   if (msg?.type === "LISTENMODE_OFFSCREEN_PLAY") {
     activeTabId =
       msg.options?.tabId != null && Number.isFinite(Number(msg.options.tabId))
@@ -69,13 +106,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "LISTENMODE_OFFSCREEN_CMD") {
     const cmd = msg.cmd;
     try {
-      if (cmd === "pause") player.pause();
-      else if (cmd === "resume") player.resume();
+      const target = pipeline ? "pipeline" : "player";
+      if (cmd === "pause") (pipeline ? pipeline.pause() : player.pause());
+      else if (cmd === "resume") (pipeline ? pipeline.resume() : player.resume());
       else if (cmd === "stop") {
-        player.stop();
+        if (pipeline) {
+          pipeline.stop();
+          pipeline = null;
+        } else {
+          player.stop();
+        }
         activeTabId = null;
-      } else if (cmd === "rewind") player.rewind(Number(msg.seconds) || 5);
-      else if (cmd === "setSpeed") player.setSpeed(Number(msg.rate));
+      } else if (cmd === "rewind") {
+        // Rewind isn't supported for streamed pipelines; ignore.
+        if (!pipeline) player.rewind(Number(msg.seconds) || 5);
+      } else if (cmd === "setSpeed") {
+        if (pipeline) pipeline.setSpeed(Number(msg.rate));
+        else player.setSpeed(Number(msg.rate));
+      }
       sendResponse({ ok: true });
     } catch (e) {
       sendResponse({ ok: false, error: String(e?.message || e) });
@@ -84,8 +132,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg?.type === "LISTENMODE_OFFSCREEN_GET_STATE") {
-    const s = player.getPlaybackState();
-    sendResponse({ ok: true, ...s });
+    if (pipeline) {
+      const playing = pipeline.isPlaying && !pipeline.stopped;
+      const paused =
+        !!pipeline.audioContext && pipeline.audioContext.state === "suspended";
+      sendResponse({ ok: true, playing, paused });
+    } else {
+      const s = player.getPlaybackState();
+      sendResponse({ ok: true, ...s });
+    }
     return true;
   }
 

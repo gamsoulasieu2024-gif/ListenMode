@@ -53,6 +53,177 @@ export async function generateElevenLabsAudio(text, voiceId, apiKey) {
   return new Blob([blob], { type: "audio/mpeg" });
 }
 
+/**
+ * Streaming ElevenLabs pipeline: enqueue sentences as they arrive and play buffers sequentially.
+ * Designed for offscreen usage (AudioContext allowed).
+ */
+export class AudioPipeline extends EventTarget {
+  constructor() {
+    super();
+    /** @type {AudioContext | null} */
+    this.audioContext = null;
+    /** @type {AudioBuffer[]} */
+    this.queue = [];
+    /** @type {boolean} */
+    this.isPlaying = false;
+    /** @type {boolean} */
+    this.stopped = false;
+    /** @type {AudioBufferSourceNode | null} */
+    this.activeSource = null;
+    /** @type {AbortController[]} */
+    this._controllers = [];
+    /** @type {number} */
+    this.rate = 1.0;
+    /** @type {boolean} */
+    this._firedStart = false;
+  }
+
+  _ensureContext() {
+    if (!this.audioContext || this.audioContext.state === "closed") {
+      const g = typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : {};
+      const Ctx = g.AudioContext || g.webkitAudioContext;
+      if (!Ctx) throw new Error("AudioContext not available");
+      this.audioContext = new Ctx();
+    }
+    return this.audioContext;
+  }
+
+  /**
+   * Fire-and-forget: starts fetching/decoding, then queues for playback.
+   * @param {string} text
+   * @param {string} voiceId
+   * @param {string} apiKey
+   */
+  async addSentence(text, voiceId, apiKey) {
+    if (this.stopped) return;
+    const t = String(text || "").trim();
+    if (!t) return;
+
+    const ctx = this._ensureContext();
+    await ctx.resume();
+
+    const controller = new AbortController();
+    this._controllers.push(controller);
+
+    const res = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": apiKey,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          text: t,
+          model_id: "eleven_turbo_v2",
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+        }),
+        signal: controller.signal
+      }
+    );
+
+    if (!res.ok) {
+      const err = new Error(`ElevenLabs HTTP ${res.status}`);
+      /** @type {any} */ (err).status = res.status;
+      throw err;
+    }
+
+    const arrayBuffer = await res.arrayBuffer();
+    const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+    if (this.stopped) return;
+    this.queue.push(audioBuffer);
+    if (!this.isPlaying) {
+      void this.playNext();
+    }
+  }
+
+  async playNext() {
+    if (this.stopped) return;
+    if (this.queue.length === 0) {
+      this.isPlaying = false;
+      return;
+    }
+
+    const ctx = this._ensureContext();
+    await ctx.resume();
+
+    this.isPlaying = true;
+    const buffer = this.queue.shift();
+    if (!buffer) {
+      this.isPlaying = false;
+      return;
+    }
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.playbackRate.value = this.rate;
+    source.connect(ctx.destination);
+    this.activeSource = source;
+
+    source.onended = () => {
+      this.activeSource = null;
+      if (this.stopped) return;
+      void this.playNext();
+    };
+
+    if (!this._firedStart) {
+      this._firedStart = true;
+      this.dispatchEvent(new CustomEvent("start"));
+    }
+
+    source.start(0);
+  }
+
+  pause() {
+    if (this.stopped) return;
+    if (this.audioContext) void this.audioContext.suspend();
+    this.dispatchEvent(new CustomEvent("pause"));
+  }
+
+  resume() {
+    if (this.stopped) return;
+    if (this.audioContext) void this.audioContext.resume();
+    this.dispatchEvent(new CustomEvent("resume"));
+  }
+
+  /**
+   * @param {number} rate
+   */
+  setSpeed(rate) {
+    const r = Number(rate);
+    if (Number.isNaN(r)) return;
+    this.rate = Math.min(2, Math.max(0.5, r));
+    if (this.activeSource) {
+      this.activeSource.playbackRate.value = this.rate;
+    }
+  }
+
+  stop() {
+    this.stopped = true;
+    this.isPlaying = false;
+    for (const c of this._controllers) {
+      try {
+        c.abort();
+      } catch {
+        /* ignore */
+      }
+    }
+    this._controllers = [];
+    try {
+      this.activeSource?.stop(0);
+    } catch {
+      /* ignore */
+    }
+    this.activeSource = null;
+    this.queue = [];
+    if (this.audioContext && this.audioContext.state !== "closed") {
+      void this.audioContext.close();
+    }
+    this.audioContext = null;
+    this.dispatchEvent(new CustomEvent("end"));
+  }
+}
+
 export function langCodeToBcp47(code) {
   if (!code) return BCP47_BY_LANG.en;
   const s = String(code).trim();

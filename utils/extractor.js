@@ -39,8 +39,10 @@ export async function probePdfContentType(url) {
     return false;
   }
   try {
-    const r = await fetch(url, { method: "HEAD", credentials: "include" });
-    const ct = (r.headers.get("content-type") || "").toLowerCase();
+    /** @type {{ success: boolean, contentType?: string, error?: string }} */
+    const out = await chrome.runtime.sendMessage({ action: "fetchURL", url, method: "HEAD" });
+    if (!out?.success) return false;
+    const ct = String(out.contentType || "").toLowerCase();
     return ct.includes("application/pdf");
   } catch {
     return false;
@@ -56,8 +58,12 @@ export async function extractPDFContent(pdfUrl) {
   try {
     pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("libs/pdf.worker.min.mjs");
 
-    const response = await fetch(pdfUrl);
-    const arrayBuffer = await response.arrayBuffer();
+    const result = await chrome.runtime.sendMessage({
+      action: "fetchURL",
+      url: pdfUrl
+    });
+    if (!result?.success) throw new Error(result?.error || "Fetch failed");
+    const arrayBuffer = new Uint8Array(result.data || []).buffer;
 
     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
 

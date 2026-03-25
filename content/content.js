@@ -3,14 +3,26 @@
  * re-injection does not redeclare top-level const/let (SyntaxError).
  */
 (function initListenModeContent() {
-  if (globalThis.__listenModeContentLoaded) {
-    return;
+  if (window.__listenModeInjected) return;
+  window.__listenModeInjected = true;
+
+  function safeSendMessage(msg, callback) {
+    try {
+      if (!chrome.runtime?.id) return; // context is gone
+      chrome.runtime.sendMessage(msg, (response) => {
+        if (chrome.runtime.lastError) return; // silently ignore
+        if (callback) callback(response);
+      });
+    } catch {
+      // Extension context invalidated — silently ignore
+    }
   }
-  globalThis.__listenModeContentLoaded = true;
 
-  const MAX_EXTRACT_CHARS = 8000;
+  if (typeof MAX_EXTRACT_CHARS === "undefined") {
+    var MAX_EXTRACT_CHARS = 8000;
+  }
 
-  const ROOT_SELECTORS = [
+  var ROOT_SELECTORS = [
     "#mw-content-text",
     ".markdown-body",
     "#readme .markdown-body",
@@ -24,7 +36,7 @@
     '[role="main"]'
   ];
 
-  const NOISE_SELECTOR = [
+  var NOISE_SELECTOR = [
     "nav",
     "header",
     "footer",
@@ -105,7 +117,7 @@
     return "";
   }
 
-  const HIGHLIGHT_CLASS = "listenmode-highlight";
+  var HIGHLIGHT_CLASS = "listenmode-highlight";
 
   function injectHighlightStyles() {
     if (document.getElementById("listenmode-highlight-styles")) return;
@@ -529,7 +541,7 @@
     const dragEl = root.querySelector(".listenmode-mini-drag");
 
     function sendCtrl(cmd) {
-      void chrome.runtime.sendMessage({ type: "LISTENMODE_MINI_CONTROL", cmd });
+      safeSendMessage({ type: "LISTENMODE_MINI_CONTROL", cmd });
     }
 
     btnRw?.addEventListener("click", (e) => {
@@ -706,7 +718,7 @@
 
   function stopPlaybackFromDyslexiaUi() {
     teardownDyslexiaOverlay();
-    void chrome.runtime.sendMessage({ type: "LISTENMODE_AUDIO_CMD", cmd: "stop" });
+    safeSendMessage({ type: "LISTENMODE_AUDIO_CMD", cmd: "stop" });
   }
 
   /**
@@ -809,77 +821,81 @@
   }
 
   window.addEventListener("pagehide", () => {
-    void chrome.runtime.sendMessage({ type: "LISTENMODE_CONTENT_UNLOAD" });
+    safeSendMessage({ type: "LISTENMODE_CONTENT_UNLOAD" });
   });
 
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg?.type === "LISTENMODE_MINI") {
-      handleMiniMessage(msg);
-      sendResponse({ success: true });
-      return true;
-    }
-    if (msg?.action === "extractContent") {
-      try {
-        const content = extractPageContent();
-        sendResponse({ success: true, content });
-      } catch (e) {
-        sendResponse({
-          success: false,
-          error: String(e?.message || e)
-        });
-      }
-      return;
-    }
-
-    if (msg?.action === "highlightSentence") {
-      try {
-        highlightSentence(String(msg.sentence || ""));
+  try {
+    chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+      if (msg?.type === "LISTENMODE_MINI") {
+        handleMiniMessage(msg);
         sendResponse({ success: true });
-      } catch (e) {
-        sendResponse({ success: false, error: String(e?.message || e) });
+        return true;
       }
-      return;
-    }
+      if (msg?.action === "extractContent") {
+        try {
+          const content = extractPageContent();
+          sendResponse({ success: true, content });
+        } catch (e) {
+          sendResponse({
+            success: false,
+            error: String(e?.message || e)
+          });
+        }
+        return;
+      }
 
-    if (msg?.action === "clearHighlights") {
-      try {
-        clearAllHighlights();
-        sendResponse({ success: true });
-      } catch (e) {
-        sendResponse({ success: false, error: String(e?.message || e) });
+      if (msg?.action === "highlightSentence") {
+        try {
+          highlightSentence(String(msg.sentence || ""));
+          sendResponse({ success: true });
+        } catch (e) {
+          sendResponse({ success: false, error: String(e?.message || e) });
+        }
+        return;
       }
-      return;
-    }
 
-    if (msg?.action === "showDyslexiaOverlay") {
-      try {
-        const raw = msg.sentences;
-        const sents = Array.isArray(raw) ? raw.map((x) => String(x || "")) : [];
-        showDyslexiaOverlay(sents);
-        sendResponse({ success: true });
-      } catch (e) {
-        sendResponse({ success: false, error: String(e?.message || e) });
+      if (msg?.action === "clearHighlights") {
+        try {
+          clearAllHighlights();
+          sendResponse({ success: true });
+        } catch (e) {
+          sendResponse({ success: false, error: String(e?.message || e) });
+        }
+        return;
       }
-      return;
-    }
 
-    if (msg?.action === "dyslexiaOverlayHighlight") {
-      try {
-        dyslexiaOverlaySetActive(Number(msg.index));
-        sendResponse({ success: true });
-      } catch (e) {
-        sendResponse({ success: false, error: String(e?.message || e) });
+      if (msg?.action === "showDyslexiaOverlay") {
+        try {
+          const raw = msg.sentences;
+          const sents = Array.isArray(raw) ? raw.map((x) => String(x || "")) : [];
+          showDyslexiaOverlay(sents);
+          sendResponse({ success: true });
+        } catch (e) {
+          sendResponse({ success: false, error: String(e?.message || e) });
+        }
+        return;
       }
-      return;
-    }
 
-    if (msg?.action === "dyslexiaOverlayHide") {
-      try {
-        teardownDyslexiaOverlay();
-        sendResponse({ success: true });
-      } catch (e) {
-        sendResponse({ success: false, error: String(e?.message || e) });
+      if (msg?.action === "dyslexiaOverlayHighlight") {
+        try {
+          dyslexiaOverlaySetActive(Number(msg.index));
+          sendResponse({ success: true });
+        } catch (e) {
+          sendResponse({ success: false, error: String(e?.message || e) });
+        }
+        return;
       }
-    }
-  });
+
+      if (msg?.action === "dyslexiaOverlayHide") {
+        try {
+          teardownDyslexiaOverlay();
+          sendResponse({ success: true });
+        } catch (e) {
+          sendResponse({ success: false, error: String(e?.message || e) });
+        }
+      }
+    });
+  } catch {
+    // Context already invalidated, skip
+  }
 })();
