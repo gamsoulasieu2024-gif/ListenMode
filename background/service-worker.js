@@ -28,6 +28,24 @@ let lastPaused = false;
 /** True after a successful LISTENMODE_PLAY until end / error / stop. */
 let sessionActive = false;
 
+// --- MV3 keep-alive (session-scoped) ---
+/** @type {ReturnType<typeof setInterval> | null} */
+let keepAliveInterval = null;
+
+function startKeepAlive() {
+  if (keepAliveInterval) return;
+  keepAliveInterval = setInterval(() => {
+    chrome.runtime.getPlatformInfo(() => {});
+  }, 20000);
+}
+
+function stopKeepAlive() {
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval);
+    keepAliveInterval = null;
+  }
+}
+
 /**
  * Popup opens when the user clicks the toolbar icon — configured via
  * manifest "action.default_popup". MV3 does not use a persistent background page;
@@ -218,6 +236,18 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Popup session keep-alive control (prevents MV3 cold starts mid-session).
+  if (message?.action === "sessionStart") {
+    startKeepAlive();
+    sendResponse?.({ ok: true });
+    return false;
+  }
+  if (message?.action === "sessionEnd") {
+    stopKeepAlive();
+    sendResponse?.({ ok: true });
+    return false;
+  }
+
   if (message?.type === "LISTENMODE_OFFSCREEN_READY") {
     offscreenReadyResolve?.();
     offscreenReadyResolve = null;

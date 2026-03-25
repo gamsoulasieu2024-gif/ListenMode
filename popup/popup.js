@@ -1,5 +1,90 @@
 import { askAboutPage } from "../utils/ai.js";
 
+// --- Session caches (in-memory, reset when popup closes) ---
+let cachedContent = null;
+let cachedTabId = null;
+let cachedTabUrl = null;
+let cachedSourceMode = null;
+
+const scriptCache = {
+  listen: null,
+  understand: null
+};
+
+function resetSessionCaches() {
+  cachedContent = null;
+  cachedTabId = null;
+  cachedTabUrl = null;
+  cachedSourceMode = null;
+  scriptCache.listen = null;
+  scriptCache.understand = null;
+}
+
+async function getActiveTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
+
+async function prewarmContentScript() {
+  try {
+    const tab = await getActiveTab();
+    if (!tab?.id) return;
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ["content/content.js"]
+    });
+  } catch {
+    // silent fail if already injected or if page blocks injection
+  }
+}
+
+async function getContentForSession() {
+  const tab = await getActiveTab();
+  const tabId = tab?.id ?? null;
+  const tabUrl = tab?.url ?? null;
+  if (
+    cachedContent &&
+    cachedTabId != null &&
+    tabId != null &&
+    cachedTabId === tabId &&
+    cachedTabUrl &&
+    tabUrl &&
+    cachedTabUrl === tabUrl
+  ) {
+    return { context: cachedContent, tabId: cachedTabId, sourceMode: cachedSourceMode || "webpage" };
+  }
+
+  const ext = await chrome.runtime.sendMessage({ type: "LISTENMODE_EXTRACT_CONTEXT" });
+  if (!ext?.ok) {
+    throw new Error(ext?.error || "Could not read this page.");
+  }
+
+  cachedContent = ext.context;
+  cachedTabId = ext.tabId != null ? ext.tabId : tabId;
+  cachedTabUrl = tabUrl;
+  cachedSourceMode = ext.sourceMode === "pdf" ? "pdf" : "webpage";
+  scriptCache.listen = null;
+  scriptCache.understand = null;
+
+  return { context: cachedContent, tabId: cachedTabId, sourceMode: cachedSourceMode };
+}
+
+function sendSessionStart() {
+  try {
+    chrome.runtime.sendMessage({ action: "sessionStart" });
+  } catch {
+    /* ignore */
+  }
+}
+
+function sendSessionEnd() {
+  try {
+    chrome.runtime.sendMessage({ action: "sessionEnd" });
+  } catch {
+    /* ignore */
+  }
+}
+
 /**
  * Bridges playback to the offscreen document so audio continues after the popup closes.
  * @extends EventTarget
@@ -932,6 +1017,7 @@ speech.addEventListener("playback-error", (e) => {
 });
 
 speech.addEventListener("end", () => {
+  sendSessionEnd();
   resetControlsToInitialState();
 });
 
@@ -957,6 +1043,7 @@ btnRewind.addEventListener("click", () => {
 });
 
 btnAudioStop.addEventListener("click", () => {
+  sendSessionEnd();
   speech.stop();
   resetControlsToInitialState();
 });
@@ -974,6 +1061,8 @@ askPageInput?.addEventListener("keydown", (e) => {
 
 window.addEventListener("pagehide", () => {
   setPlaybackBadge(false);
+  sendSessionEnd();
+  resetSessionCaches();
 });
 
 /**
@@ -1006,18 +1095,26 @@ async function generateAndPlay(context, lang, mode, opts = {}) {
         : retryState?.sourceMode === "pdf"
           ? "pdf"
           : "webpage";
-  const fp = await hashContext(context);
-  const elevenKey = await getStoredElevenlabsKey();
+  const fpPromise = hashContext(context);
+  const elevenKeyPromise = getStoredElevenlabsKey();
   const voiceId = getSelectedVoiceId();
   const forceSimplify = getForceSimplify();
 
   let tabId = tabIdOpt ?? retryState?.tabId;
   if (tabId == null) {
-    const t = await chrome.runtime.sendMessage({ type: "LISTENMODE_GET_ACTIVE_TAB_ID" });
-    if (t?.ok && t.tabId != null) tabId = t.tabId;
+    try {
+      const tab = await getActiveTab();
+      if (tab?.id != null) tabId = tab.id;
+    } catch {
+      /* ignore */
+    }
   }
 
-  const pageTitle = await getTabTitle(tabId);
+  const [fp, elevenKey, pageTitle] = await Promise.all([
+    fpPromise,
+    elevenKeyPromise,
+    getTabTitle(tabId)
+  ]);
 
   const playOpts = {
     apiKey: elevenKey,
@@ -1027,6 +1124,49 @@ async function generateAndPlay(context, lang, mode, opts = {}) {
     dyslexiaMode: getDyslexiaMode(),
     dyslexiaInPopup: getDyslexiaMode() && sourceMode === "pdf"
   };
+
+  // Fast path: in-memory script cache for this popup session.
+  if (!skipCache && scriptCache[mode]) {
+    const cached = scriptCache[mode];
+    if (!isPlaybackSupported(elevenKey)) {
+      setStatus("");
+      showError(AUDIO_UNSUPPORTED_MSG, { retry: false });
+      return false;
+    }
+    setStatus(preview ? "Preview" : "Playing…", { busy: false });
+    setContentMetaLabel({
+      mode,
+      contentType: mode === "listen" ? cached.contentType : null,
+      complexity: cached.complexity || "",
+      audience: cached.audience || "",
+      simplified: !!cached.simplified
+    });
+    if (mode === "understand") {
+      outputHeading.textContent = "Explanation";
+      outputBody.textContent = cached.text;
+      outputPanel.hidden = false;
+    }
+    const cachedSents = cached.sentences?.length ? cached.sentences : cached.wordTimings;
+    const truncated = preview
+      ? truncateForPreview(cached.text, cachedSents || null)
+      : { text: cached.text, sentences: cachedSents?.length ? cachedSents : null };
+    const playText = truncated.text;
+    const playSents = truncated.sentences;
+    const wc = countWords(playText);
+    setNowPlayingBar(true, {
+      mode,
+      contentType: mode === "listen" ? cached.contentType : null,
+      wordCount: wc
+    });
+    applySpeedFromUI();
+    lastPlayWasPreview = preview;
+    speech.play(playText, lang, {
+      ...playOpts,
+      sentences: playSents?.length ? playSents : undefined,
+      pageTitle
+    });
+    return true;
+  }
 
   if (!skipCache) {
     const cached = await getCachedScript(fp, mode, lang, forceSimplify);
@@ -1078,6 +1218,7 @@ async function generateAndPlay(context, lang, mode, opts = {}) {
         sentences: playSents?.length ? playSents : undefined,
         pageTitle
       });
+      scriptCache[mode] = cached;
       return true;
     }
   }
@@ -1109,6 +1250,15 @@ async function generateAndPlay(context, lang, mode, opts = {}) {
     audience: gen.audience != null ? String(gen.audience) : "",
     simplified: gen.simplified === true
   });
+  scriptCache[mode] = {
+    text,
+    contentType: listenContentType,
+    sentences,
+    wordTimings,
+    complexity: gen.complexity != null ? String(gen.complexity) : "",
+    audience: gen.audience != null ? String(gen.audience) : "",
+    simplified: gen.simplified === true
+  };
 
   if (!isPlaybackSupported(elevenKey)) {
     setStatus("");
@@ -1178,17 +1328,10 @@ async function runStartFlow(opts = {}) {
   retryState = null;
   setProcessing(true);
   try {
-    const src = await chrome.runtime.sendMessage({ type: "LISTENMODE_GET_SOURCE_MODE" });
-    setStatus(src?.mode === "pdf" ? "Reading PDF…" : "Extracting page…", { busy: false });
-
-    const ext = await chrome.runtime.sendMessage({ type: "LISTENMODE_EXTRACT_CONTEXT" });
-    if (!ext?.ok) {
-      showError(ext?.error || "Could not read this page.");
-      setStatus("");
-      return;
-    }
-
+    setStatus("Extracting page…", { busy: false });
+    const ext = await getContentForSession();
     const sourceMode = ext.sourceMode === "pdf" ? "pdf" : "webpage";
+    setStatus(sourceMode === "pdf" ? "Reading PDF…" : "Extracting page…", { busy: false });
     retryState = {
       context: ext.context,
       mode,
@@ -1274,17 +1417,10 @@ async function runPreviewFlow() {
   retryState = null;
   setProcessing(true);
   try {
-    const src = await chrome.runtime.sendMessage({ type: "LISTENMODE_GET_SOURCE_MODE" });
-    setStatus(src?.mode === "pdf" ? "Reading PDF…" : "Extracting page…", { busy: false });
-
-    const ext = await chrome.runtime.sendMessage({ type: "LISTENMODE_EXTRACT_CONTEXT" });
-    if (!ext?.ok) {
-      showError(ext?.error || "Could not read this page.");
-      setStatus("");
-      return;
-    }
-
+    setStatus("Extracting page…", { busy: false });
+    const ext = await getContentForSession();
     const sourceMode = ext.sourceMode === "pdf" ? "pdf" : "webpage";
+    setStatus(sourceMode === "pdf" ? "Reading PDF…" : "Extracting page…", { busy: false });
     retryState = {
       context: ext.context,
       mode,
@@ -1323,6 +1459,11 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 popupDyslexiaExit?.addEventListener("click", () => {
   speech.stop();
+});
+
+document.addEventListener("DOMContentLoaded", () => {
+  sendSessionStart();
+  void prewarmContentScript();
 });
 
 void loadPrefs();

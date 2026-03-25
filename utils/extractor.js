@@ -3,6 +3,8 @@
  * lives in content/content.js so the content script does not need dynamic import().
  */
 
+import * as pdfjsLib from "../libs/pdf.min.mjs";
+
 export const PDF_EXTRACT_CAP = 8000;
 
 export const PDF_EXTRACT_FAIL_MSG =
@@ -46,122 +48,44 @@ export async function probePdfContentType(url) {
 }
 
 /**
- * Extract plain text from the built-in PDF viewer tab via PDF.js (MAIN world).
- * @param {number} tabId
- * @returns {Promise<{ title: string, content: string }>}
+ * Extract plain text from a PDF URL via bundled PDF.js (MV3-safe).
+ * @param {string} pdfUrl
+ * @returns {Promise<{ title: string, content: string | null, error?: string }>}
  */
-export async function extractPDFContent(tabId) {
-  if (tabId == null) throw new Error("No tab for PDF extraction.");
+export async function extractPDFContent(pdfUrl) {
+  try {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("libs/pdf.worker.min.mjs");
 
-  const grants = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    func: /** @param {number} m */ async (m) => {
-      const pdfjsLib =
-        globalThis["pdfjs-dist/build/pdf"] ||
-        globalThis["pdfjs-dist/build/pdf.mjs"] ||
-        globalThis.pdfjsLib;
+    const response = await fetch(pdfUrl);
+    const arrayBuffer = await response.arrayBuffer();
 
-      if (!pdfjsLib || typeof pdfjsLib.getDocument !== "function") {
-        return {
-          ok: false,
-          error:
-            "Could not extract PDF text. The file may be scanned or image-based."
-        };
-      }
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
 
-      const cap = Math.min(Math.max(Number(m) || 8000, 1000), 50000);
+    let fullText = "";
+    const maxPages = Math.min(pdf.numPages, 20);
 
-      const embed =
-        document.querySelector('embed[type="application/pdf"]') ||
-        document.querySelector("embed[src]");
-      const iframe =
-        document.querySelector('iframe[type="application/pdf"]') ||
-        document.querySelector('iframe[src*=".pdf"]') ||
-        document.querySelector("iframe[src]");
+    for (let i = 1; i <= maxPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const pageText = content.items.map((item) => item.str).join(" ");
+      fullText += pageText + "\n\n";
+    }
 
-      let pdfUrl = "";
-      if (embed?.src) pdfUrl = embed.src;
-      else if (iframe?.src) pdfUrl = iframe.src;
-      else pdfUrl = globalThis.location?.href || "";
+    const title = decodeURIComponent(
+      (pdfUrl.split("/").pop() || "PDF Document").replace(".pdf", "")
+    );
 
-      if (!pdfUrl) {
-        return {
-          ok: false,
-          error:
-            "Could not extract PDF text. The file may be scanned or image-based."
-        };
-      }
-
-      try {
-        if (pdfjsLib.GlobalWorkerOptions && !pdfjsLib.GlobalWorkerOptions.workerSrc) {
-          const base = globalThis.location?.origin || "";
-          if (base) {
-            pdfjsLib.GlobalWorkerOptions.workerSrc = `${base}/pdf.worker.js`;
-          }
-        }
-      } catch {
-        /* ignore */
-      }
-
-      let title = "document.pdf";
-      try {
-        const u = new URL(pdfUrl, globalThis.location?.href || undefined);
-        const segs = u.pathname.split("/").filter(Boolean);
-        const leaf = segs.length ? segs[segs.length - 1] : "";
-        if (leaf) title = decodeURIComponent(leaf) || title;
-      } catch {
-        /* default */
-      }
-
-      try {
-        const loadingTask = pdfjsLib.getDocument({
-          url: pdfUrl,
-          withCredentials: false
-        });
-        const pdf = await loadingTask.promise;
-        /** @type {string[]} */
-        const acc = [];
-        let joined = "";
-        const numPages = pdf.numPages || 0;
-        for (let p = 1; p <= numPages; p++) {
-          if (joined.length >= cap) break;
-          const page = await pdf.getPage(p);
-          const tc = await page.getTextContent();
-          let chunk = "";
-          for (const item of tc.items) {
-            if (item && typeof item === "object" && "str" in item) {
-              chunk += /** @type {{ str: string }} */ (item).str;
-            }
-          }
-          acc.push(chunk.replace(/\s+/g, " ").trim());
-          joined = acc.join("\n\n");
-        }
-        let text = acc.join("\n\n").replace(/\s+/g, " ").trim();
-        if (text.length > cap) {
-          text = text.slice(0, cap).replace(/\s+\S*$/, "").trimEnd();
-          if (!text.endsWith("…")) text += "…";
-        }
-        return { ok: true, title, content: text };
-      } catch {
-        return {
-          ok: false,
-          error:
-            "Could not extract PDF text. The file may be scanned or image-based."
-        };
-      }
-    },
-    args: [PDF_EXTRACT_CAP]
-  });
-
-  const raw = grants?.[0]?.result;
-  if (!raw || !raw.ok || !String(raw.content || "").trim()) {
-    throw new Error((raw && raw.error) || PDF_EXTRACT_FAIL_MSG);
+    return {
+      title,
+      content: fullText.trim().slice(0, PDF_EXTRACT_CAP)
+    };
+  } catch (err) {
+    return {
+      title: "PDF Document",
+      content: null,
+      error: "Could not read PDF: " + String(err?.message || err)
+    };
   }
-  return {
-    title: String(raw.title || "document.pdf"),
-    content: String(raw.content || "")
-  };
 }
 
 /**
